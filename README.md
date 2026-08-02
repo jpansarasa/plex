@@ -34,48 +34,47 @@ generated copy is the only one systemd and `check-update` read — systemd opens
 `EnvironmentFile=` in PID 1 itself, and `tank` is `failmode=wait`, so a pin file
 on the pool would let a faulted pool wedge PID 1.
 
-## Backups — read this one
+## Backups
 
-**`/tank/plex` is the only irreplaceable thing this repo touches, and until
-recently nothing was protecting it.** The `Media/` and `Metadata/` trees (about
-70 GB of generated thumbnails and downloaded artwork) are expensive to rebuild
-but not *lost*. The irreplaceable part is roughly 565 MB:
-`com.plexapp.plugins.library.db`, its `blobs` companion, and `Preferences.xml`.
-Between them they hold every view count, resume offset, rating, playlist,
-collection and managed-user association, plus the server's `MachineIdentifier`.
-None of it is derivable from the media files and none of it can be re-entered by
-hand. Losing `Preferences.xml` specifically mints a new server identity, which
-means plex.tv treats this as a different server: every shared-library invitation
-has to be re-issued and re-accepted.
+**The media is the asset, and it is well protected.** `tank/tv`, `tank/movies`
+and `tank/music` — 28.6 TB — each carry `com.sun:auto-snapshot:daily=true`, keep
+31 days of snapshots, and are replicated nightly to the backup host. That is the
+thing that would actually hurt to lose, and losing it is covered.
 
-Three things are true about its protection, and they are easy to confuse:
-
-**Local snapshots: yes, now.** `tank/plex` carries
-`com.sun:auto-snapshot:daily=true` set *locally* (it must be local to override
-the `false` inherited from `tank`, and a local property is what travels with a
-`zfs send`). `install` sets it and takes a first snapshot when it *creates* the
-dataset. The label is `daily` with keep=31, not the `monthly` the ntfy and
-searxng repos use: this pool reserves monthly for cheap regenerable service
-config and daily for user state, and watch history is user state.
-
-**Plex's own database backups: yes, but they are not a backup.** Plex's Butler
-task writes dated copies into `Plug-in Support/Databases/` every few days. Those
-are genuinely useful — they cover database corruption and a failed schema
-migration — but they sit on the same dataset, the same pool and the same
-chassis. A directory full of rotating dated `.db` files is exactly what a backup
-regime looks like, which is how the absence of one goes unnoticed.
-
-**Offsite: no.** `/opt/zfs/zfs-replicate` runs `zfs-backup.ssh -x tank/plex`, so
-this dataset is deliberately excluded from the nightly replication. **Do not
-simply remove that exclusion.** The backup host already has a dataset named
-`tank/plex` — it is a second, independent, *running* Plex server, not a copy of
+**`/tank/plex` is Plex's own config and library database, and it is deliberately
+excluded from that replication.** That is the right call, for two independent
+reasons. First, almost all of it regenerates: `Media/` and `Metadata/` are about
+70 GB of generated thumbnails and downloaded artwork, and the library structure
+itself rebuilds from a scan of media that *is* backed up. Second, the backup host
+already has a dataset named `tank/plex` — its own live Plex server, not a copy of
 this one — and `zfs-backup.ssh` receives with `zfs recv -eF`, which forces the
-destination name. Removing the `-x` aims a full stream at a live filesystem.
-The exclusion is correct; what was missing is this paragraph explaining why.
+destination name. **Do not remove the `-x tank/plex` from
+`/opt/zfs/zfs-replicate`**: it would aim a full stream at a live filesystem. The
+exclusion was always correct; what was missing was any record of why, since
+`/opt/zfs` is not version-controlled and carries no comment.
 
-Getting the 565 MB offsite without touching that exclusion is the open item. The
-cheapest correct approach is to copy the newest database pair and
-`Preferences.xml` into `tank/backup`, which *is* replicated nightly.
+What does *not* regenerate is small: watch history, resume positions, ratings,
+playlists, collections, and the server's `MachineIdentifier` (losing that one
+makes plex.tv treat this as a different server, so shared-library invitations
+have to be re-issued). Roughly 565 MB of database and `Preferences.xml`.
+
+`tank/plex` now carries `com.sun:auto-snapshot:daily=true`, set *locally* — it
+must be local to override the `false` inherited from `tank`, and a local property
+is what travels with a `zfs send`. `install` sets it when it creates the dataset.
+That covers the failure modes that actually happen to a database: a bad upgrade
+migrating it badly, corruption, an accidental delete. And because the pool is
+portable, those snapshots travel with the drives to a new chassis.
+
+The one case it does not cover is total loss of the pool itself. In that
+scenario you are restoring 28.6 TB of media from the backup host and re-scanning
+anyway, and the cost of the gap is watch history rather than anything
+irreplaceable — which is a reasonable thing to accept rather than build a second
+backup path for.
+
+Plex also writes its own dated database copies into `Plug-in Support/Databases/`
+every few days. Those are useful for corruption and failed migrations, but they
+live on the same dataset, so treat them as a rollback convenience rather than a
+backup.
 
 ## Media access is by the world bits, not the group
 
