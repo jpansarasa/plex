@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+#
+# Idempotent (re)install / redeploy for the Plex service.
+#
+# Safe to run repeatedly: every run converges to the desired state and does not
+# error on things that already exist. Plex stores its configuration and library
+# database directly on the ZFS dataset below, so no config files are deployed
+# from this directory -- this repo is the unit/lifecycle definition only.
+#
+# NOTE: the last step restarts Plex, which interrupts any active streams.
+# Run it at a convenient time.
+#
+set -euo pipefail
+
+# Always operate relative to this script's own directory, wherever it's run from.
+cd "$(dirname "$(readlink -f "$0")")"
+
+DATASET=tank/plex
+TRANSCODE=/var/plex
+SVC_UID=2004
+MEDIA_GROUP=media
+MEDIA_ROOTS=(/export/tv /export/movies /export/music)
+
+die() { echo "install: $*" >&2; exit 1; }
+
+# 0. Preconditions. Fail loudly and early rather than half-converging.
+[ "$(id -u)" -eq 0 ] || die "must run as root (try: sudo ./install)"
+
+# The systemd units hardcode /opt/plex and /tank/plex. A clone anywhere else
+# would enable units pointing at a tree that isn't the one you just edited.
+[ "$PWD" = /opt/plex ] || die "must be installed at /opt/plex (found $PWD); the systemd units hardcode that path"
+
+for cmd in docker zfs zpool systemctl adduser usermod; do
+    command -v "$cmd" >/dev/null || die "missing required command: $cmd"
+done
+zpool list -H -o name tank >/dev/null 2>&1 || die "zpool 'tank' not found"
+
+# Created by the nzb install, which owns the shared media group.
+getent group "$MEDIA_GROUP" >/dev/null || die "group '$MEDIA_GROUP' does not exist -- run the nzb install first"
+
+# 1. Service user (uid/gid 2004, matches DOCKER_UID/DOCKER_GID) + media group
+if ! getent passwd plex >/dev/null; then
+    adduser --system --group --uid "$SVC_UID" plex
+fi
+usermod --append --groups "$MEDIA_GROUP" plex   # idempotent: no-op if already a member
+
+# 2. ZFS dataset holding the Plex config and library database
+if ! zfs list -H -o name "$DATASET" >/dev/null 2>&1; then
+    zfs create -p "$DATASET"
+fi
+
+# 3. Transcode scratch. plex.service bind-mounts this path, and it is
+#    deliberately NOT a ZFS dataset: it lives on the NVMe, which is faster for
+#    transcoding and keeps that churn off the pool. Nothing used to create it,
+#    so on a fresh machine docker made it root-owned and Plex (uid 2004) could
+#    not write there.
+mkdir -p "$TRANSCODE"
+chown plex:plex "$TRANSCODE"
+
+# 3a. Media roots. Plex owns none of these files -- it reads them purely
+#     through the shared media group, which is why the usermod above matters.
+#     If a restore or a stray chown moves a tree out of the group, Plex shows
+#     an empty library with no error in any log, so surface it here.
+#
+#     Reported, not fixed: these trees belong to the services that write
+#     them, not to Plex. Fixing them is their owners' call.
+for d in "${MEDIA_ROOTS[@]}"; do
+    if [ ! -d "$d" ]; then
+        echo "install: WARNING -- media root $d does not exist" >&2
+        continue
+    fi
+    g=$(stat -c %G "$d")
+    if [ "$g" != "$MEDIA_GROUP" ]; then
+        echo "install: WARNING -- $d is group '$g', expected '$MEDIA_GROUP'; Plex will not see it" >&2
+    fi
+    # group needs r(4)+x(1) to traverse and read
+    gbits=$(( ($(stat -c %a "$d") / 10) % 10 ))
+    if [ $(( gbits & 5 )) -ne 5 ]; then
+        echo "install: WARNING -- $d is not group-readable ($(stat -c %A "$d")); Plex will not see it" >&2
+    fi
+    # Drift below the root matters just as much and is easy to miss: a manual
+    # copy lands as user:user and that album or season quietly never appears.
+    # Metadata-only walk, a few seconds across the whole library.
+    n=$(find "$d" ! -group "$MEDIA_GROUP" -printf . 2>/dev/null | wc -c)
+    if [ "$n" -gt 0 ]; then
+        echo "install: WARNING -- $n entries under $d are not group '$MEDIA_GROUP'" >&2
+        echo "install:            fix with: sudo find $d ! -group $MEDIA_GROUP -print0 | sudo xargs -0r chgrp $MEDIA_GROUP" >&2
+    fi
+done
+
+# 4. Retire the obsolete pull-not-on-boot drop-in. The base unit no longer
+#    pulls on start (updates come from plex-update.timer). Safe if already gone.
+rm -f /etc/systemd/system/plex.service.d/pull-not-on-boot.conf
+rmdir --ignore-fail-on-non-empty /etc/systemd/system/plex.service.d 2>/dev/null || true
+
+# 5. Register units (idempotent). `enable` installs the /opt symlink for the
+#    main service and the timer; the oneshot update service has no [Install]
+#    section, so it is `link`ed instead so the timer can resolve it by name.
+systemctl enable "$PWD/plex.service"
+if ! systemctl cat plex-update.service >/dev/null 2>&1; then
+    systemctl link "$PWD/plex-update.service"
+fi
+systemctl enable "$PWD/plex-update.timer"
+systemctl daemon-reload
+
+# 6. Apply: (re)start the service (picks up any staged image) and activate the
+#    update timer now (it was enabled above).
+systemctl restart plex.service
+systemctl start plex-update.timer
+
+echo "install: plex converged."

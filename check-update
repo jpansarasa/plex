@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+#
+# Plex image update check (fetch + flag, does NOT apply).
+#
+# Pulls plexinc/pms-docker:latest and compares it to the image the running
+# container is actually using. If they differ, an update is "staged": it is
+# flagged (systemd journal + a marker file) but the container is left running
+# the old image. Apply a staged update with:
+#     sudo systemctl restart plex.service
+# A reboot also applies it (the service's `docker run` uses the pulled image).
+#
+# No ntfy push here (unlike searxng/ntfy) — Plex surfaces its own update notices.
+#
+# Run by plex-update.timer; safe to run by hand.
+#
+set -euo pipefail
+
+IMAGE=plexinc/pms-docker:latest
+MARKER=/run/plex-update-available
+
+# Fetch the latest tag. This updates the local :latest pointer only; it does
+# NOT touch the running container.
+docker pull --quiet "$IMAGE" >/dev/null
+
+# $() strips the trailing newline; a failed inspect yields "" -> defaulted to
+# "none". (Avoid `|| echo none`, which can leave a stray blank line in the value.)
+running=$(docker inspect --format '{{.Image}}' plex 2>/dev/null || true)
+latest=$(docker image inspect --format '{{.Id}}' "$IMAGE" 2>/dev/null || true)
+running=${running:-none}
+latest=${latest:-none}
+
+# If the container isn't running, `docker inspect` yields "none", which would
+# otherwise look identical to "a newer image is staged" and write a spurious
+# marker/"update staged" flag (e.g. during a restart/maintenance window). Skip.
+if [ "$running" = "none" ]; then
+    echo "Plex container not running; skipping update check." >&2
+    exit 0
+fi
+
+if [ "$running" != "$latest" ]; then
+    {
+        echo "Plex update staged (not applied)."
+        echo "running: $running"
+        echo "latest:  $latest"
+        echo "checked: $(date -Is)"
+        echo "Apply:   sudo systemctl restart plex.service"
+    } | tee "$MARKER" >&2
+    exit 0
+fi
+
+rm -f "$MARKER"
+echo "Plex already running the latest image ($latest)."

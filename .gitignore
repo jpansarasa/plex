@@ -1,0 +1,6 @@
+# Local cruft from in-place editing on the host.
+*.bak
+*.save
+*.log
+*.orig
+*.new

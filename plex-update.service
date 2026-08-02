@@ -1,0 +1,10 @@
+[Unit]
+Description=Plex image update check (fetch :latest, flag if newer than running)
+Documentation=file:/opt/plex/check-update
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/plex/check-update
