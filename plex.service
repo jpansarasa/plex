@@ -1,38 +1,154 @@
 [Unit]
 Description=Plex container
-Requires=docker.service docker.socket
-After=docker.service docker.socket
-ConditionPathIsDirectory=/tank/plex
+
+# Wants=, NOT Requires=. Both gate on docker, but they fail in opposite ways.
+# A failed Requires= dependency aborts the START JOB: the unit never enters
+# start, so Restart= is never armed, and it sits at inactive/dead with
+# Result=success -- absent from `systemctl --failed`, and NOT revived when
+# docker is repaired, because nothing re-enqueues a start job. docker.service is
+# StartLimitBurst=3/StartLimitIntervalSec=60, so a boot where containerd or the
+# firewall races dockerd makes docker give up in ~4s and this unit follows it
+# into a silent grave. With Wants=, a dead dockerd instead fails ExecStart,
+# which DOES arm Restart=always, so it retries every 30s and recovers on its own.
+#
+# docker.socket is deliberately NOT listed. It adds no readiness -- a bound
+# socket does not prove dockerd is alive -- docker.service already carries
+# Requires=docker.socket, and naming it here only adds a second abort surface
+# and a second path by which stopping something else propagates a CLEAN stop to
+# Plex, which does not rearm Restart=.
+Wants=docker.service
+After=docker.service
+
+# Ordering against the mounts, so a normal boot does not race them. Ordering
+# only -- deliberately no RequiresMountsFor=, which would become a Requires=
+# edge (and the wedge above) the moment zfs-mount-generator is enabled.
+After=zfs-mount.service
+
+# There is deliberately no Condition* on the dataset. ConditionPathIsDirectory
+# =/tank/plex used to be the only gate, and a BARE MOUNTPOINT satisfies it, so
+# it passed in exactly the fail-open case it looked like it was guarding. The
+# guards are ExecStartPre= below, which are real start failures and therefore
+# retried by Restart=always.
+StartLimitIntervalSec=0
 
 [Service]
 Restart=always
 RestartSec=30
 Environment=DOCKER_UID=2004 DOCKER_GID=2004
 
+# Image tag. latest is the normal state; a bad release is pinned out by writing
+# PLEX_TAG into /tank/plex/image.env and re-running install, which renders the
+# value here. The render is what systemd reads: EnvironmentFile= is opened by
+# PID 1 ITSELF (measured on this host), and tank is failmode=wait, so pointing
+# it at the pool would let a faulted pool wedge PID 1. The render is filtered to
+# PLEX_TAG alone, because EnvironmentFile= is applied AFTER Environment= and an
+# unfiltered file could otherwise redefine DOCKER_UID above.
+#
+# Pinning matters more here than for the sibling services: Plex migrates the
+# library schema forward on first start of a new binary, and not every migration
+# has a rollback. Being able to decline a release is the only lever there is.
+Environment=PLEX_TAG=latest
+EnvironmentFile=-/etc/plex/image.env
+
+# The config dataset. Without this guard an unmounted tank/plex leaves a bare
+# directory, `docker run -v` binds it, and the image's first-run script mints a
+# NEW MachineIdentifier and admin token -- an unclaimed Plex server, listening on
+# every interface, offering full setup access to anyone on the network, serving
+# the whole media library, while the healthcheck fetches /web/index.html and
+# reports healthy. -C stops findmnt canonicalizing (it would readlink() /tank,
+# and tank is failmode=wait, so the guard would block on the very fault it
+# exists to detect).
+ExecStartPre=/bin/sh -c '/usr/bin/findmnt -C --type zfs --source tank/plex --mountpoint /tank/plex --noheadings >/dev/null || { echo "<3>plex: tank/plex is NOT mounted at /tank/plex -- refusing to start, because Plex would initialise a BRAND NEW unclaimed server and serve the whole library to the network. Retrying every 30s."; exit 1; }'
+
+# Mounted but empty is the same outcome. Preferences.xml is the proof that this
+# is a real install rather than a first run; test -s only stats it and never
+# reads the token inside. timeout(1)-wrapped because it stat()s the pool.
+ExecStartPre=/usr/bin/timeout 10 /bin/sh -c 'test -s "/tank/plex/Library/Application Support/Plex Media Server/Preferences.xml" || { echo "<3>plex: Preferences.xml is missing or empty -- refusing to start, because Plex would treat this as a first run and mint a new server identity. Retrying every 30s."; exit 1; }'
+
+# The media datasets. No sibling precedent -- ntfy and searxng have one dataset
+# each -- but it transfers with more force here: those services degrade to a bad
+# config, whereas Plex scanning an empty-but-present library root marks every
+# item unavailable, and with "empty trash after every scan" that deletes the
+# items from the database along with their watch state and collections. The
+# mountpoints live on the root filesystem, so they survive an unmount and the
+# bind mount then succeeds against an empty tree.
+ExecStartPre=/bin/sh -c 'for d in tv movies music; do /usr/bin/findmnt -C --type zfs --source "tank/$d" --mountpoint "/export/$d" --noheadings >/dev/null || { echo "<3>plex: tank/$d is NOT mounted at /export/$d -- refusing to start, because Plex would scan an empty library root and mark every item in that section unavailable. Retrying every 30s."; exit 1; }; done'
+
 # No image pull here: boot/start must be fast and network-order-independent.
 # Updates are fetched out-of-band by plex-update.timer and applied on the next
 # (re)start. `docker run` still auto-pulls if the image is entirely missing.
+#
+# There is deliberately NO --group-add here, and that is worth explaining because
+# the obvious fix does not work. The README used to claim Plex reads the media
+# trees through the shared `media` group (gid 1500). It does not, and never did:
+# /proc/<pms>/status reports groups 44 100 993 2004, with no 1500. The host
+# account's membership never reaches the container. Adding --group-add 1500 was
+# tried and MEASURED: it reaches container PID 1, but the image runs the server
+# via `s6-setuidgid plex`, which calls setgroups() from the IMAGE's own
+# /etc/group and discards it. So the flag would look load-bearing while doing
+# nothing -- the exact defect being fixed. What actually makes the library
+# readable is the world bits (o=rx) on the media trees; install checks those.
+#
+# The media mounts are :ro. Plex needs no write access to them and had none
+# before this change either -- but only by accident, because `other` happens to
+# get r-x rather than rwx. Anyone later "fixing" the group model by setting
+# PLEX_GID=1500 would hand Plex unlink rights over the whole library in a single
+# edit. A read-only bind is the only structural barrier: it is enforced at the
+# VFS mount level, so unlike permission bits it also constrains container root,
+# which still holds CAP_DAC_OVERRIDE.
+#
+# --cap-drop=ALL with a minimal re-add. The add list is NOT decorative: KILL is
+# required because s6-supervise runs as uid 0 and signals the Plex process
+# running as uid 2004, and a cross-uid signal needs CAP_KILL -- without it the
+# container can only ever die by SIGKILL. CHOWN/FOWNER/SETUID/SETGID/SETFCAP are
+# used by the image's first-run script (usermod/groupmod, chown of /transcode)
+# and by s6-setuidgid. DAC_OVERRIDE is the one to fear, and it is what the
+# no-new-privileges flag and the nosuid/nodev dataset properties defend against.
 ExecStart=/usr/bin/docker run \
     --rm \
     --name=plex \
     --net=host \
     --device=/dev/dri:/dev/dri \
+    --security-opt no-new-privileges:true \
+    --cap-drop=ALL \
+    --cap-add=CHOWN \
+    --cap-add=FOWNER \
+    --cap-add=SETUID \
+    --cap-add=SETGID \
+    --cap-add=SETFCAP \
+    --cap-add=KILL \
+    --cap-add=DAC_OVERRIDE \
+    --log-opt max-size=10m \
+    --log-opt max-file=3 \
     -e TZ='America/New_York' \
     -e PLEX_UID=${DOCKER_UID} \
     -e PLEX_GID=${DOCKER_GID} \
     -v /tank/plex:/config \
     -v /var/plex:/transcode \
-    -v /export/tv:/data/tv \
-    -v /export/movies:/data/movies \
-    -v /export/music:/data/music \
-    --health-cmd='curl --head --fail http://0.0.0.0:32400/web/index.html || exit 1' \
+    -v /export/tv:/data/tv:ro \
+    -v /export/movies:/data/movies:ro \
+    -v /export/music:/data/music:ro \
+    --health-cmd='curl --head --fail http://127.0.0.1:32400/identity || exit 1' \
     --health-interval=60s \
     --health-retries=3 \
     --health-timeout=5s \
     --health-start-period=3m \
-    plexinc/pms-docker:latest
+    plexinc/pms-docker:${PLEX_TAG}
 
-ExecStop=/usr/bin/docker stop --time 5 plex
+# --timeout, not the deprecated --time (which warned on every stop), and 30s
+# rather than 5s. The image's finish script sends SIGTERM, sleeps 5, then
+# SIGKILLs; docker's old 5s grace expired at exactly that moment, so the
+# container was SIGKILLed on EVERY stop and the attached `docker run` exited 137.
+# Plex itself always shut down cleanly well inside that window -- there was no
+# data risk -- but it meant a routine stop and a genuine crash were
+# indistinguishable in the journal, and `systemctl stop plex` left the unit
+# `failed`. Nothing keyed on unit failure could be trusted.
+#
+# The inspect wrapper handles the other half: with --rm a crashed container is
+# already gone when ExecStop runs, and `docker stop` on a missing container exits
+# 1, adding a phantom FAILURE line next to the real one.
+ExecStop=/bin/sh -c '/usr/bin/docker inspect plex >/dev/null 2>&1 || exit 0; exec /usr/bin/docker stop --timeout 30 plex'
+TimeoutStopSec=45
 
 [Install]
 WantedBy=multi-user.target

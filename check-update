@@ -9,17 +9,33 @@
 #     sudo systemctl restart plex.service
 # A reboot also applies it (the service's `docker run` uses the pulled image).
 #
-# No ntfy push here (unlike searxng/ntfy) — Plex surfaces its own update notices.
+# No ntfy push here (unlike searxng/ntfy) — Plex surfaces its own update notices
+# in its UI. Note that is only true for updates Plex APPLIES; an update this
+# script has merely STAGED is visible in the journal and in $MARKER, and nowhere
+# else. $MARKER is on tmpfs, so it does not survive a reboot that did not apply.
+# `journalctl -u plex-update.service` is the authoritative record.
 #
 # Run by plex-update.timer; safe to run by hand.
 #
 set -euo pipefail
 
-IMAGE=plexinc/pms-docker:latest
+# Track whatever tag plex.service would actually start, or this reports on an
+# image a restart would never run. The unit passes PLEX_TAG in; a by-hand run
+# reads the same rendered file the unit reads. Parsed, never sourced.
+if [ -r /etc/plex/image.env ]; then
+    tag=$(grep -m1 -oP '^PLEX_TAG=\K.*' /etc/plex/image.env 2>/dev/null || true)
+    tag=${tag%$'\r'}; tag=${tag#\"}; tag=${tag%\"}
+    [ -n "$tag" ] && PLEX_TAG="$tag"
+fi
+PLEX_TAG="${PLEX_TAG:-latest}"
+
+IMAGE="plexinc/pms-docker:${PLEX_TAG}"
 MARKER=/run/plex-update-available
 
-# Fetch the latest tag. This updates the local :latest pointer only; it does
-# NOT touch the running container.
+# Fetch the configured tag. This updates the local tag pointer only; it does
+# NOT touch the running container. A registry outage aborts here under set -e,
+# which is correct: comparing against a stale local image would report "up to
+# date" when nothing was actually checked.
 docker pull --quiet "$IMAGE" >/dev/null
 
 # $() strips the trailing newline; a failed inspect yields "" -> defaulted to
@@ -40,6 +56,7 @@ fi
 if [ "$running" != "$latest" ]; then
     {
         echo "Plex update staged (not applied)."
+        echo "tag:     $PLEX_TAG"
         echo "running: $running"
         echo "latest:  $latest"
         echo "checked: $(date -Is)"
@@ -49,4 +66,16 @@ if [ "$running" != "$latest" ]; then
 fi
 
 rm -f "$MARKER"
-echo "Plex already running the latest image ($latest)."
+echo "Plex already running the current $PLEX_TAG image ($latest)."
+
+# Pinned: nothing above fired, but a pin is meant to be temporary, so report when
+# upstream moves -- that is the signal the bad release was superseded. Not written
+# to $MARKER: a restart applies none of this.
+if [ "$PLEX_TAG" != latest ]; then
+    docker pull --quiet plexinc/pms-docker:latest >/dev/null 2>&1 || true
+    upstream=$(docker image inspect --format '{{.Id}}' plexinc/pms-docker:latest 2>/dev/null || true)
+    if [ -n "$upstream" ] && [ "$upstream" != "$running" ]; then
+        echo "note: pinned to $PLEX_TAG; upstream :latest has moved ($upstream)."
+        echo "      un-pin by removing PLEX_TAG from /tank/plex/image.env, then re-run /opt/plex/install."
+    fi
+fi

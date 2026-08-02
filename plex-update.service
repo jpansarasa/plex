@@ -1,10 +1,20 @@
 [Unit]
-Description=Plex image update check (fetch :latest, flag if newer than running)
+Description=Plex image update check (fetch the configured tag, flag if newer than running)
 Documentation=file:/opt/plex/check-update
+
+# Requires= here, deliberately, even though the same directive is a defect in
+# plex.service. The wedge there exists because nothing re-enqueues a start job
+# after a dependency-aborted start; a timer enqueues a brand-new one at every
+# elapse, so the worst case is one skipped daily check.
 Requires=docker.service
 After=docker.service network-online.target
 Wants=network-online.target
+ConditionPathExists=/opt/plex/check-update
 
 [Service]
 Type=oneshot
+# Must agree with plex.service, or the checker reports on a different image than
+# the one a restart would actually run. See that unit for the pin story.
+Environment=PLEX_TAG=latest
+EnvironmentFile=-/etc/plex/image.env
 ExecStart=/opt/plex/check-update

@@ -15,11 +15,17 @@ set -euo pipefail
 # Always operate relative to this script's own directory, wherever it's run from.
 cd "$(dirname "$(readlink -f "$0")")"
 
+ROOT=/tank/plex
 DATASET=tank/plex
 TRANSCODE=/var/plex
 SVC_UID=2004
 MEDIA_GROUP=media
-MEDIA_ROOTS=(/export/tv /export/movies /export/music)
+MEDIA_DATASETS=(tv movies music)
+# Optional tag pin. Source of truth on the dataset, so it travels with the pool;
+# rendered to /etc because systemd opens EnvironmentFile= in PID 1 itself and
+# tank is failmode=wait. Same split as the ntfy and searxng repos.
+IMAGE_ENV_SRC="$ROOT/image.env"
+IMAGE_ENV=/etc/plex/image.env
 
 die() { echo "install: $*" >&2; exit 1; }
 
@@ -30,7 +36,7 @@ die() { echo "install: $*" >&2; exit 1; }
 # would enable units pointing at a tree that isn't the one you just edited.
 [ "$PWD" = /opt/plex ] || die "must be installed at /opt/plex (found $PWD); the systemd units hardcode that path"
 
-for cmd in docker zfs zpool systemctl adduser usermod; do
+for cmd in docker zfs zpool systemctl adduser usermod findmnt curl; do
     command -v "$cmd" >/dev/null || die "missing required command: $cmd"
 done
 zpool list -H -o name tank >/dev/null 2>&1 || die "zpool 'tank' not found"
@@ -38,62 +44,131 @@ zpool list -H -o name tank >/dev/null 2>&1 || die "zpool 'tank' not found"
 # Created by the nzb install, which owns the shared media group.
 getent group "$MEDIA_GROUP" >/dev/null || die "group '$MEDIA_GROUP' does not exist -- run the nzb install first"
 
-# 1. Service user (uid/gid 2004, matches DOCKER_UID/DOCKER_GID) + media group
+# 1. Service user (uid/gid 2004, matches DOCKER_UID/DOCKER_GID in plex.service).
 if ! getent passwd plex >/dev/null; then
     adduser --system --group --uid "$SVC_UID" plex
 fi
-usermod --append --groups "$MEDIA_GROUP" plex   # idempotent: no-op if already a member
+# Existence isn't enough: plex.service hardcodes 2004, and the transcode dir is
+# chowned to whatever uid this account has. A plex account at any other uid
+# leaves the container unable to write transcodes, which fails at playback time
+# rather than at deploy time.
+if [ "$(id -u plex)" != "$SVC_UID" ] || [ "$(id -g plex)" != "$SVC_UID" ]; then
+    die "user plex is uid=$(id -u plex) gid=$(id -g plex), expected $SVC_UID:$SVC_UID (see plex.service)"
+fi
+# Host-side convenience only -- NOT the mechanism Plex reads media through.
+# The container's supplementary groups come from the IMAGE's /etc/group via
+# s6-setuidgid, so this membership never reaches the server process (measured:
+# /proc/<pms>/status shows groups 44 100 993 2004, no 1500). Kept because it is
+# harmless and lets a human in the plex account read the trees; see step 3a for
+# what actually governs access.
+usermod --append --groups "$MEDIA_GROUP" plex
 
-# 2. ZFS dataset holding the Plex config and library database
+# 2. ZFS dataset holding the Plex config and library database.
+#
+#    A dataset created from scratch here is opted into zfs-auto-snapshot and
+#    given a first snapshot. The label is `daily` with keep=31, NOT the `monthly`
+#    the ntfy and searxng repos use: this pool reserves monthly for cheap,
+#    regenerable service config and daily for user state, and /tank/plex is user
+#    state living under a service name. Watch history, ratings, collections and
+#    play positions are not derivable from the media files and cannot be
+#    re-entered by hand, so a 31-day loss window would be the wrong trade.
+#
+#    Creation-only, deliberately: on a restore the property arrives with the
+#    received dataset, and a dataset opted out on purpose must not be silently
+#    opted back in. NOTE this means the block does not retrofit an existing
+#    dataset -- if you are reading this on a host installed before it landed,
+#    set the property by hand once.
 if ! zfs list -H -o name "$DATASET" >/dev/null 2>&1; then
     zfs create -p "$DATASET"
+    zfs set com.sun:auto-snapshot:daily=true "$DATASET"
+    # No setuid binary and no device node belongs on a media or config dataset,
+    # and both bind mounts are visible to a container that runs as root.
+    zfs set setuid=off devices=off "$DATASET"
+    if command -v zfs-auto-snapshot >/dev/null; then
+        zfs-auto-snapshot --label=daily --keep=31 "$DATASET"
+    fi
+fi
+
+#    Existing is not the same as mounted, and `zfs list` succeeds for either.
+#    Everything below, and the container itself, would otherwise operate on a
+#    bare mountpoint -- which for Plex means minting a brand-new unclaimed
+#    server. The unit has the same guard; this one stops install from restarting
+#    into it.
+if [ "$(findmnt -no SOURCE "$ROOT" 2>/dev/null)" != "$DATASET" ]; then
+    die "$ROOT is not a mount of $DATASET -- refusing to converge (try: zfs mount $DATASET)"
 fi
 
 # 3. Transcode scratch. plex.service bind-mounts this path, and it is
 #    deliberately NOT a ZFS dataset: it lives on the NVMe, which is faster for
 #    transcoding and keeps that churn off the pool. Nothing used to create it,
-#    so on a fresh machine docker made it root-owned and Plex (uid 2004) could
-#    not write there.
+#    so on a fresh machine docker made it root-owned and Plex could not write.
 mkdir -p "$TRANSCODE"
 chown plex:plex "$TRANSCODE"
 
-# 3a. Media roots. Plex owns none of these files -- it reads them purely
-#     through the shared media group, which is why the usermod above matters.
-#     If a restore or a stray chown moves a tree out of the group, Plex shows
-#     an empty library with no error in any log, so surface it here.
+# 3a. Media access. Plex owns none of these files. What it reads them through is
+#     the WORLD bits (o=rx), not the `media` group -- see the note at step 1.
+#     That was worth establishing rather than assuming, because the check that
+#     used to live here audited the group and would therefore pass a tree Plex
+#     cannot read (mode 2770, group media) and fail one it reads perfectly
+#     (mode 755, group sonarr).
 #
-#     Reported, not fixed: these trees belong to the services that write
-#     them, not to Plex. Fixing them is their owners' call.
-for d in "${MEDIA_ROOTS[@]}"; do
-    if [ ! -d "$d" ]; then
-        echo "install: WARNING -- media root $d does not exist" >&2
+#     Reported, not fixed: these trees belong to the services that write them.
+#
+#     Advisory only. Nothing here may abort the deploy -- the previous version
+#     could, because `n=$(find ...)` under `set -euo pipefail` propagates find's
+#     exit status, and find exits 1 for any traversal error. The most likely one
+#     is a path vanishing mid-walk, which is routine on trees that sonarr and
+#     radarr rename into continuously. That killed the run before the units were
+#     ever registered.
+[ -x /export ] || echo "install: WARNING -- /export is not world-traversable; Plex cannot reach any library" >&2
+for d in "${MEDIA_DATASETS[@]}"; do
+    p="/export/$d"
+    if [ ! -d "$p" ]; then
+        echo "install: WARNING -- media root $p does not exist" >&2
         continue
     fi
-    g=$(stat -c %G "$d")
-    if [ "$g" != "$MEDIA_GROUP" ]; then
-        echo "install: WARNING -- $d is group '$g', expected '$MEDIA_GROUP'; Plex will not see it" >&2
+    mode=$(stat -c %a "$p" 2>/dev/null || true)
+    [ -n "$mode" ] || { echo "install: WARNING -- cannot stat $p" >&2; continue; }
+    # `other` needs r+x to traverse and list. -perm -o=rx is exact and avoids
+    # the digit arithmetic the old check used.
+    if ! find "$p" -maxdepth 0 -perm -o=rx -printf '' 2>/dev/null; then
+        echo "install: WARNING -- $p is mode $mode; Plex needs o=rx and will not see it" >&2
     fi
-    # group needs r(4)+x(1) to traverse and read
-    gbits=$(( ($(stat -c %a "$d") / 10) % 10 ))
-    if [ $(( gbits & 5 )) -ne 5 ]; then
-        echo "install: WARNING -- $d is not group-readable ($(stat -c %A "$d")); Plex will not see it" >&2
-    fi
-    # Drift below the root matters just as much and is easy to miss: a manual
-    # copy lands as user:user and that album or season quietly never appears.
-    # Metadata-only walk, a few seconds across the whole library.
-    n=$(find "$d" ! -group "$MEDIA_GROUP" -printf . 2>/dev/null | wc -c)
-    if [ "$n" -gt 0 ]; then
-        echo "install: WARNING -- $n entries under $d are not group '$MEDIA_GROUP'" >&2
-        echo "install:            fix with: sudo find $d ! -group $MEDIA_GROUP -print0 | sudo xargs -0r chgrp $MEDIA_GROUP" >&2
+    nf=$(find "$p" -type f ! -perm -o=r -printf . 2>/dev/null | wc -c || true)
+    nd=$(find "$p" -type d ! -perm -o=rx -printf . 2>/dev/null | wc -c || true)
+    if [ "${nf:-0}" -gt 0 ] || [ "${nd:-0}" -gt 0 ]; then
+        echo "install: WARNING -- under $p: ${nf:-0} files not world-readable, ${nd:-0} dirs not world-traversable; Plex will silently not see them" >&2
+        echo "install:            usual cause is a umask of 007 in the writing service. Fix with:" >&2
+        echo "install:            sudo find $p -type f ! -perm -o=r -exec chmod o+r {} + ; sudo find $p -type d ! -perm -o=rx -exec chmod o+rx {} +" >&2
     fi
 done
 
-# 4. Retire the obsolete pull-not-on-boot drop-in. The base unit no longer
+# 4. Render the systemd-visible tag pin. Always written so the unit always finds
+#    a file; an absent source simply means latest. Only PLEX_TAG crosses over:
+#    EnvironmentFile= is applied AFTER Environment=, so an unfiltered file could
+#    redefine DOCKER_UID and change the uid the server drops to.
+mkdir -p /etc/plex
+pin=$(grep -m1 -oP '^PLEX_TAG=\K.*' "$IMAGE_ENV_SRC" 2>/dev/null || true)
+pin=${pin%$'\r'}; pin=${pin#\"}; pin=${pin%\"}
+cat > "$IMAGE_ENV" <<EOF
+# GENERATED by /opt/plex/install -- do not edit.
+# Source of truth is $IMAGE_ENV_SRC, on the dataset. Edit that and re-run install.
+# This copy exists only so systemd never reads an EnvironmentFile from the pool:
+# PID 1 opens that file itself, and tank is failmode=wait.
+PLEX_TAG=${pin:-latest}
+EOF
+chown root:root "$IMAGE_ENV"; chmod 0644 "$IMAGE_ENV"
+if [ -e "$IMAGE_ENV_SRC" ]; then chown root:root "$IMAGE_ENV_SRC"; chmod 0644 "$IMAGE_ENV_SRC"; fi
+if [ -n "$pin" ] && [ "$pin" != latest ]; then
+    echo "install: image tag PINNED to $pin (source: $IMAGE_ENV_SRC)" >&2
+fi
+
+# 5. Retire the obsolete pull-not-on-boot drop-in. The base unit no longer
 #    pulls on start (updates come from plex-update.timer). Safe if already gone.
 rm -f /etc/systemd/system/plex.service.d/pull-not-on-boot.conf
 rmdir --ignore-fail-on-non-empty /etc/systemd/system/plex.service.d 2>/dev/null || true
 
-# 5. Register units (idempotent). `enable` installs the /opt symlink for the
+# 6. Register units (idempotent). `enable` installs the /opt symlink for the
 #    main service and the timer; the oneshot update service has no [Install]
 #    section, so it is `link`ed instead so the timer can resolve it by name.
 systemctl enable "$PWD/plex.service"
@@ -103,9 +178,35 @@ fi
 systemctl enable "$PWD/plex-update.timer"
 systemctl daemon-reload
 
-# 6. Apply: (re)start the service (picks up any staged image) and activate the
-#    update timer now (it was enabled above).
-systemctl restart plex.service
+# 7. Apply. A failed restart is reported rather than left to `set -e`, because
+#    the unit retries on its own: an ExecStartPre failure puts it in a 30s
+#    auto-restart loop, so "restart returned 1" means "not up YET", not "dead".
+#    Letting set -e kill the script here would also skip the timer start below.
+systemctl restart plex.service ||
+    echo "install: WARNING -- plex.service did not start cleanly; it retries every 30s. Reason: journalctl -p err -u plex -n 20" >&2
 systemctl start plex-update.timer
 
-echo "install: plex converged."
+# 8. Smoke test. Until now "converged" meant "systemd accepted a fork":
+#    plex.service is Type=simple, so restart returns the moment `docker run` is
+#    exec'd, and everything after that -- a bad staged image, a missing
+#    /dev/dri, an unmounted dataset, a corrupt config -- was invisible.
+#    Restart=always then hides it further, because RestartSec=30 exceeds the
+#    default StartLimitIntervalSec, so the unit cycles forever at
+#    `activating (auto-restart)` and never reaches `failed`.
+#
+#    /identity is served without a token and is cheaper than the web index.
+#    The budget is generous on purpose: the unit's own healthcheck allows a 3m
+#    start period, and Plex legitimately takes minutes to open a large database.
+health_url="http://127.0.0.1:32400/identity"
+for _ in $(seq 90); do
+    if curl -fsS --max-time 2 -o /dev/null "$health_url" 2>/dev/null; then
+        echo "install: plex converged and answering on $health_url"
+        exit 0
+    fi
+    sleep 2
+done
+
+die "the unit started but Plex never answered $health_url within 180s.
+  It may still be opening a large database, or it may be crash-looping. Check:
+    docker logs --tail 30 plex
+    journalctl -p err -u plex -n 30"
